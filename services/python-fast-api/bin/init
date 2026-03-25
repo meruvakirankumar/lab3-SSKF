@@ -1,0 +1,10 @@
+#!/bin/sh
+
+set -eu
+
+cd "$(dirname "$0")/.."
+
+export VIRTUAL_ENV="$HOME/.cache/venvs/api"
+export UV_NO_PROGRESS=true
+
+uv sync --active
