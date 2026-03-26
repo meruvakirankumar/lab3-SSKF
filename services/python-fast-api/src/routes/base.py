@@ -20,6 +20,8 @@ router = APIRouter()
 
 # Load OpenAPI key from environment or config file
 OPENAPI_KEY = os.environ.get("OPENAPI_KEY")
+AZURE_OPENAI_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT")
+AZURE_OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION")
 
 if not OPENAPI_KEY:
     # Try to load from mounted config file
@@ -39,7 +41,10 @@ if not OPENAPI_KEY:
                         if line.startswith("OPENAPI_KEY="):
                             OPENAPI_KEY = line.split("=", 1)[1].strip('"').strip("'")
                             logger.info(f"✓ OpenAPI key loaded from {key_file}")
-                            break
+                        elif line.startswith("AZURE_OPENAI_DEPLOYMENT="):
+                            AZURE_OPENAI_DEPLOYMENT = line.split("=", 1)[1].strip('"').strip("'")
+                        elif line.startswith("AZURE_OPENAI_API_VERSION="):
+                            AZURE_OPENAI_API_VERSION = line.split("=", 1)[1].strip('"').strip("'")
                 if OPENAPI_KEY:
                     break
             except Exception as e:
@@ -420,7 +425,7 @@ Respond only with valid JSON."""
             if is_openrouter
             else "https://api.openai.com/v1/chat/completions"
         )
-        model_name = "openai/gpt-4o-mini" if is_openrouter else "gpt-4o-mini"
+        model_name = "openai/gpt-5.4" if is_openrouter else "gpt-5.4"
 
         headers = {
             "Authorization": f"Bearer {OPENAPI_KEY}",
@@ -440,6 +445,12 @@ Respond only with valid JSON."""
             ],
             "temperature": 0.7,
         }
+        
+        # Add Azure OpenAI configuration if available
+        if AZURE_OPENAI_DEPLOYMENT:
+            payload["deployment"] = AZURE_OPENAI_DEPLOYMENT
+        if AZURE_OPENAI_API_VERSION:
+            payload["api_version"] = AZURE_OPENAI_API_VERSION
         
         response = requests.post(
             api_url,
