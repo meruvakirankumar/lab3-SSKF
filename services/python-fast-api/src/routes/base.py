@@ -73,6 +73,67 @@ SUPPORTED_EXTENSIONS = {
     ".cpp",
 }
 
+EXTENSION_TO_LANGUAGE: dict[str, str] = {
+    ".py": "Python",
+    ".js": "JavaScript",
+    ".jsx": "JavaScript",
+    ".ts": "TypeScript",
+    ".tsx": "TypeScript",
+    ".java": "Java",
+    ".go": "Go",
+    ".rb": "Ruby",
+    ".php": "PHP",
+    ".cs": "C#",
+    ".c": "C",
+    ".cpp": "C++",
+}
+
+LANGUAGE_COLORS: dict[str, str] = {
+    "Python": "#3776ab",
+    "JavaScript": "#f7df1e",
+    "TypeScript": "#3178c6",
+    "Java": "#b07219",
+    "Go": "#00add8",
+    "Ruby": "#701516",
+    "PHP": "#4f5d95",
+    "C#": "#178600",
+    "C": "#555555",
+    "C++": "#f34b7d",
+}
+
+# (config_filename, substring_to_match, framework_name)
+FRAMEWORK_INDICATORS: list[tuple[str, str, str]] = [
+    ("package.json", '"react"', "React"),
+    ("package.json", '"next"', "Next.js"),
+    ("package.json", '"vue"', "Vue.js"),
+    ("package.json", '"@angular/core"', "Angular"),
+    ("package.json", '"svelte"', "Svelte"),
+    ("package.json", '"express"', "Express"),
+    ("package.json", '"fastify"', "Fastify"),
+    ("package.json", '"tailwindcss"', "Tailwind CSS"),
+    ("package.json", '"vite"', "Vite"),
+    ("package.json", '"react-router"', "React Router"),
+    ("requirements.txt", "fastapi", "FastAPI"),
+    ("requirements.txt", "django", "Django"),
+    ("requirements.txt", "flask", "Flask"),
+    ("requirements.txt", "sqlalchemy", "SQLAlchemy"),
+    ("requirements.txt", "celery", "Celery"),
+    ("pyproject.toml", "fastapi", "FastAPI"),
+    ("pyproject.toml", "django", "Django"),
+    ("pyproject.toml", "flask", "Flask"),
+    ("pyproject.toml", "pydantic", "Pydantic"),
+    ("pyproject.toml", "uvicorn", "Uvicorn"),
+    ("go.mod", "gin-gonic", "Gin"),
+    ("go.mod", "echo", "Echo"),
+    ("go.mod", "fiber", "Fiber"),
+    ("pom.xml", "spring-boot", "Spring Boot"),
+    ("pom.xml", "spring-web", "Spring Web"),
+    ("build.gradle", "spring-boot", "Spring Boot"),
+    ("Gemfile", "rails", "Ruby on Rails"),
+    ("composer.json", "laravel", "Laravel"),
+    ("composer.json", "symfony", "Symfony"),
+]
+
 MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
 SCAN_MAX_FILES = int(os.environ.get("ANALYZER_SCAN_MAX_FILES", "250"))
 SCAN_MAX_FILE_BYTES = int(os.environ.get("ANALYZER_SCAN_MAX_FILE_BYTES", "200000"))
@@ -193,6 +254,14 @@ async def analyze_project(project_id: str):
         scan_ms = int((time.perf_counter() - scan_start) * 1000)
         logger.info("Scanned %s files in %sms for project %s", len(files), scan_ms, project_id)
 
+        lang_data = _detect_languages(files, extract_path)
+        project["languages"] = lang_data["languages"]
+        project["frameworks"] = lang_data["frameworks"]
+        project["primary_language"] = lang_data["primary_language"]
+        project["total_files_analyzed"] = lang_data["total_files_analyzed"]
+        project["total_lines"] = lang_data["total_lines"]
+        logger.info("Detected languages %s for project %s", [l["name"] for l in lang_data["languages"]], project_id)
+
         store_start = time.perf_counter()
         _store_analysis(project_id, files)
         store_ms = int((time.perf_counter() - store_start) * 1000)
@@ -214,6 +283,11 @@ async def analyze_project(project_id: str):
             "file_size_bytes": project["file_size_bytes"],
             "status": project["status"],
             "error_message": project["error_message"],
+            "languages": project.get("languages", []),
+            "frameworks": project.get("frameworks", []),
+            "primary_language": project.get("primary_language", "Unknown"),
+            "total_files_analyzed": project.get("total_files_analyzed", 0),
+            "total_lines": project.get("total_lines", 0),
         },
     }
 
@@ -335,6 +409,58 @@ def _extract_exports(content: str, ext: str) -> set[str]:
         if name:
             found.add(name)
     return found
+
+
+def _detect_languages(files: list[dict], extract_path: Path) -> dict:
+    """Detect programming languages and frameworks from scanned files."""
+    from collections import defaultdict
+
+    lang_files: defaultdict[str, int] = defaultdict(int)
+    lang_lines: defaultdict[str, int] = defaultdict(int)
+
+    for f in files:
+        ext = f.get("file_type", "")
+        lang = EXTENSION_TO_LANGUAGE.get(ext)
+        if lang:
+            lang_files[lang] += 1
+            lang_lines[lang] += f.get("line_count", 0)
+
+    total_files = sum(lang_files.values()) or 1
+
+    languages = []
+    for lang, count in sorted(lang_files.items(), key=lambda x: -x[1]):
+        languages.append({
+            "name": lang,
+            "file_count": count,
+            "line_count": lang_lines[lang],
+            "percentage": round(count / total_files * 100, 1),
+            "color": LANGUAGE_COLORS.get(lang, "#8e8e8e"),
+        })
+
+    # Detect frameworks by scanning well-known config files
+    frameworks: list[str] = []
+    seen: set[str] = set()
+
+    for config_file, keyword, framework in FRAMEWORK_INDICATORS:
+        if framework in seen:
+            continue
+        for match in extract_path.rglob(config_file):
+            try:
+                content = match.read_text(encoding="utf-8", errors="ignore").lower()
+                if keyword.lower() in content:
+                    frameworks.append(framework)
+                    seen.add(framework)
+                    break
+            except Exception:
+                continue
+
+    return {
+        "languages": languages,
+        "frameworks": frameworks,
+        "primary_language": languages[0]["name"] if languages else "Unknown",
+        "total_files_analyzed": len(files),
+        "total_lines": sum(lang_lines.values()),
+    }
 
 
 def _store_analysis(project_id: str, files: list[dict]) -> None:

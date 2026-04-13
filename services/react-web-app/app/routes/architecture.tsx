@@ -8,6 +8,14 @@ import { MermaidDiagram } from "~/components/MermaidDiagram";
 
 type ProjectStatus = "pending" | "analyzing" | "complete" | "failed";
 
+type LanguageInfo = {
+  name: string;
+  file_count: number;
+  line_count: number;
+  percentage: number;
+  color: string;
+};
+
 type Project = {
   id: string;
   project_name: string;
@@ -16,6 +24,11 @@ type Project = {
   file_size_bytes: number;
   status: ProjectStatus;
   error_message?: string | null;
+  languages?: LanguageInfo[];
+  frameworks?: string[];
+  primary_language?: string;
+  total_files_analyzed?: number;
+  total_lines?: number;
 };
 
 type Diagram = {
@@ -186,6 +199,69 @@ export default function Architecture() {
             </div>
           </CardContent>
         </Card>
+
+        {/* Language & Framework Detection */}
+        {project.languages && project.languages.length > 0 && (
+          <Card className="mb-8 border-slate-200 shadow-sm">
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                🔍 Languages & Frameworks Detected
+              </CardTitle>
+              <CardDescription>
+                Primary language: <span className="font-semibold">{project.primary_language}</span>
+                {project.total_files_analyzed != null && (
+                  <> · {project.total_files_analyzed} files · {(project.total_lines ?? 0).toLocaleString()} lines</>
+                )}
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-6">
+              {/* Language bar */}
+              <div className="space-y-3">
+                <div className="flex h-4 rounded-full overflow-hidden gap-[2px]">
+                  {project.languages.map((lang) => (
+                    <div
+                      key={lang.name}
+                      style={{ width: `${lang.percentage}%`, backgroundColor: lang.color }}
+                      title={`${lang.name}: ${lang.percentage}%`}
+                      className="transition-all"
+                    />
+                  ))}
+                </div>
+                {/* Per-language stats */}
+                <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
+                  {project.languages.map((lang) => (
+                    <div key={lang.name} className="flex items-start gap-2 rounded-lg border p-3">
+                      <span
+                        className="w-3 h-3 rounded-full mt-0.5 flex-shrink-0"
+                        style={{ backgroundColor: lang.color }}
+                      />
+                      <div className="min-w-0">
+                        <p className="font-semibold text-sm truncate">{lang.name}</p>
+                        <p className="text-xs text-muted-foreground">{lang.percentage}%</p>
+                        <p className="text-xs text-muted-foreground">{lang.file_count} files</p>
+                        <p className="text-xs text-muted-foreground">{lang.line_count.toLocaleString()} lines</p>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* Frameworks */}
+              {project.frameworks && project.frameworks.length > 0 && (
+                <div className="space-y-2 pt-2 border-t">
+                  <p className="text-sm font-semibold text-slate-700">Frameworks &amp; Tools</p>
+                  <div className="flex flex-wrap gap-2">
+                    {project.frameworks.map((fw) => (
+                      <Badge key={fw} variant="secondary" className="bg-indigo-100 text-indigo-900 text-sm px-3 py-1">
+                        🔧 {fw}
+                      </Badge>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </CardContent>
+          </Card>
+        )}
 
         {/* AI Insights */}
         {aiInsights && (

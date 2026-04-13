@@ -9,6 +9,14 @@ import { MermaidDiagram } from "~/components/MermaidDiagram";
 
 type ProjectStatus = "pending" | "analyzing" | "complete" | "failed";
 
+type LanguageInfo = {
+  name: string;
+  file_count: number;
+  line_count: number;
+  percentage: number;
+  color: string;
+};
+
 type Project = {
   id: string;
   project_name: string;
@@ -17,6 +25,11 @@ type Project = {
   file_size_bytes: number;
   status: ProjectStatus;
   error_message?: string | null;
+  languages?: LanguageInfo[];
+  frameworks?: string[];
+  primary_language?: string;
+  total_files_analyzed?: number;
+  total_lines?: number;
 };
 
 type Diagram = {
@@ -309,6 +322,52 @@ export default function Home() {
                   <p className="text-sm text-muted-foreground">{project.zip_filename}</p>
                   <Badge variant={statusTone}>{project.status}</Badge>
                   {project.error_message ? <p className="text-sm text-destructive">{project.error_message}</p> : null}
+
+                  {/* Language breakdown */}
+                  {project.languages && project.languages.length > 0 && (
+                    <div className="mt-3 pt-3 border-t space-y-2">
+                      <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Languages</p>
+                      {/* Color bar */}
+                      <div className="flex h-2 rounded-full overflow-hidden gap-[2px]">
+                        {project.languages.map((lang) => (
+                          <div
+                            key={lang.name}
+                            style={{ width: `${lang.percentage}%`, backgroundColor: lang.color }}
+                            title={`${lang.name}: ${lang.percentage}%`}
+                            className="transition-all"
+                          />
+                        ))}
+                      </div>
+                      {/* Legend */}
+                      <div className="flex flex-wrap gap-x-3 gap-y-1">
+                        {project.languages.map((lang) => (
+                          <div key={lang.name} className="flex items-center gap-1 text-xs">
+                            <span className="w-2.5 h-2.5 rounded-full inline-block flex-shrink-0" style={{ backgroundColor: lang.color }} />
+                            <span className="font-medium">{lang.name}</span>
+                            <span className="text-muted-foreground">{lang.percentage}%</span>
+                          </div>
+                        ))}
+                      </div>
+                      {/* Stats */}
+                      {project.total_files_analyzed != null && (
+                        <p className="text-xs text-muted-foreground">
+                          {project.total_files_analyzed} files · {(project.total_lines ?? 0).toLocaleString()} lines
+                        </p>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Frameworks */}
+                  {project.frameworks && project.frameworks.length > 0 && (
+                    <div className="space-y-1">
+                      <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Frameworks & Tools</p>
+                      <div className="flex flex-wrap gap-1">
+                        {project.frameworks.map((fw) => (
+                          <Badge key={fw} variant="outline" className="text-xs">🔧 {fw}</Badge>
+                        ))}
+                      </div>
+                    </div>
+                  )}
                   
                   {aiInsights && (
                     <div className="mt-4 pt-4 border-t space-y-2">
