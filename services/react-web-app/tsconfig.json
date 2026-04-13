@@ -16,7 +16,7 @@
     "paths": {
       "~/*": ["./app/*"],
       "@/*": ["./*"],
-      "@clients/*": ["./clients/*"]
+      "@clients/*": ["../../clients/typescript/*"]
     },
     "esModuleInterop": true,
     "verbatimModuleSyntax": true,

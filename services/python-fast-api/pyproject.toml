@@ -8,9 +8,7 @@ dependencies = [
     "cryptography>=46.0.3",
     "fastapi[standard-no-fastapi-cloud-cli]==0.116.1",
     "python-multipart>=0.0.9",
-    "psycopg[binary,pool]==3.2.9",
-    "pyjwt[cryptography]>=2.10.1",
-    "sqlmodel==0.0.24",
+    "pyjwt>=2.10.1",
     "twilio>=9.0.0",
     "uvicorn[standard]==0.35.0",
     "requests>=2.31.0",
@@ -27,5 +25,5 @@ build-backend = "hatchling.build"
 "src" = "."
 
 [tool.uv.sources]
-clients = { path = "/clients/python", editable = true }
-models = { path = "/models/python", editable = true }
+clients = { path = "../../clients/python", editable = true }
+models = { path = "../../models/python", editable = true }

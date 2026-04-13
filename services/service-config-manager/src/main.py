@@ -33,7 +33,7 @@ def main():
         logger.info(f"📊 Environment: {environment}")
 
         # Initialize config manager with config directory
-        config_dir = Path('/config')
+        config_dir = Path(get_env_var('CONFIG_DIR', str(Path(__file__).parent.parent.parent.parent / 'config')))
         logger.info(f"📁 Config directory: {config_dir}")
 
         config = Config(config_dir, environment)

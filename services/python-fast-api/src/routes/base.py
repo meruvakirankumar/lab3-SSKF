@@ -55,7 +55,7 @@ if OPENAPI_KEY:
 else:
     logger.warning("✗ OpenAPI key not found - analysis will use local pattern extraction only")
 
-UPLOAD_ROOT = Path("/tmp/code_analyzer_uploads")
+UPLOAD_ROOT = Path(os.environ.get("UPLOAD_DIR", Path.home() / "code_analyzer_uploads"))
 UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
 
 SUPPORTED_EXTENSIONS = {
