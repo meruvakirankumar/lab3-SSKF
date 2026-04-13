@@ -71,6 +71,7 @@ SUPPORTED_EXTENSIONS = {
     ".cs",
     ".c",
     ".cpp",
+    ".razor",
 }
 
 EXTENSION_TO_LANGUAGE: dict[str, str] = {
@@ -78,6 +79,7 @@ EXTENSION_TO_LANGUAGE: dict[str, str] = {
     ".js": "JavaScript",
     ".jsx": "JavaScript",
     ".ts": "TypeScript",
+    ".razor": "C#",
     ".tsx": "TypeScript",
     ".java": "Java",
     ".go": "Go",
@@ -132,6 +134,15 @@ FRAMEWORK_INDICATORS: list[tuple[str, str, str]] = [
     ("Gemfile", "rails", "Ruby on Rails"),
     ("composer.json", "laravel", "Laravel"),
     ("composer.json", "symfony", "Symfony"),
+    # .NET / Blazor — detected from .csproj content
+    (".csproj", "Microsoft.AspNetCore.Components.WebServer", "Blazor Server"),
+    (".csproj", "blazor.server", "Blazor Server"),
+    (".csproj", "Microsoft.AspNetCore.Components.WebAssembly", "Blazor WebAssembly"),
+    (".csproj", "Microsoft.AspNetCore.Components", "Blazor"),
+    (".csproj", "Microsoft.EntityFrameworkCore", "Entity Framework Core"),
+    (".csproj", "Microsoft.AspNetCore", "ASP.NET Core"),
+    (".csproj", "microsoft.net.sdk.web", "ASP.NET Core"),
+    (".csproj", "microsoft.net.sdk.razorpages", "Razor Pages"),
 ]
 
 MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
@@ -352,7 +363,11 @@ def _scan_codebase(root: Path, max_files: int = SCAN_MAX_FILES) -> list[dict]:
         dirs[:] = [
             d
             for d in dirs
-            if d not in {".git", "node_modules", "__pycache__", "dist", "build", ".venv", "venv"}
+            if d not in {
+                ".git", "node_modules", "__pycache__", "dist", "build",
+                ".venv", "venv", "obj", "bin", ".vs", ".idea",
+                "Migrations", ".nuget", "packages", "TestResults",
+            }
         ]
 
         for file_name in files:
@@ -373,8 +388,10 @@ def _scan_codebase(root: Path, max_files: int = SCAN_MAX_FILES) -> list[dict]:
             except Exception:
                 continue
 
-            imports = _extract_imports(content)
+            imports = _extract_imports(content, ext)
             exports = _extract_exports(content, ext)
+            namespace = _extract_namespace(content, ext)
+            is_page = bool(re.search(r"^@page\s+", content, re.MULTILINE)) if ext == ".razor" else False
             results.append(
                 {
                     "file_path": rel_path,
@@ -382,23 +399,128 @@ def _scan_codebase(root: Path, max_files: int = SCAN_MAX_FILES) -> list[dict]:
                     "imports": sorted(imports),
                     "exported_items": sorted(exports),
                     "line_count": len(content.splitlines()),
+                    "namespace": namespace,
+                    "is_page": is_page,
                 }
             )
 
     return results
 
 
-def _extract_imports(content: str) -> set[str]:
+# Third-party / stdlib prefixes to exclude from internal import tracking
+_STDLIB_PREFIXES = {
+    "os", "sys", "re", "json", "time", "uuid", "math", "abc", "io", "ast",
+    "copy", "enum", "typing", "pathlib", "shutil", "zipfile", "datetime",
+    "collections", "itertools", "functools", "contextlib", "dataclasses",
+    "asyncio", "concurrent", "threading", "subprocess", "logging",
+    "unittest", "http", "urllib", "email", "html", "xml", "csv", "hashlib",
+    "base64", "struct", "socket", "ssl", "signal", "traceback", "warnings",
+    # Popular third-party
+    "fastapi", "starlette", "pydantic", "uvicorn", "requests", "httpx",
+    "aiohttp", "sqlalchemy", "alembic", "celery", "redis", "pymongo",
+    "boto3", "botocore", "django", "flask", "pytest", "click", "typer",
+    "rich", "yaml", "toml", "dotenv", "jwt", "cryptography",
+    "react", "next", "vue", "angular", "svelte", "express", "lodash",
+    "axios", "fetch", "zod", "vite", "tailwind", "radix",
+}
+
+# C# / .NET external namespace roots to exclude
+_CSHARP_EXTERNAL_ROOTS = {
+    "system", "microsoft", "newtonsoft", "autofac", "castle",
+    "fluentvalidation", "automapper", "mediatr", "serilog", "nlog",
+    "xunit", "nunit", "moq", "humanizer", "polly", "npgsql",
+    "mysql", "mongodb", "stackexchange", "grpc", "protobuf",
+    "blazorise", "mudblazor", "radzen", "syncfusion", "telerik",
+    "bunit", "spectre",
+}
+
+
+def _is_external_csharp_namespace(ns: str) -> bool:
+    root = ns.split(".")[0].lower()
+    return root in _CSHARP_EXTERNAL_ROOTS
+
+
+def _is_internal_import(imp: str) -> bool:
+    """Return True only for relative or project-local import paths (JS/TS/Python)."""
+    if imp.startswith("."):
+        return True
+    if "/" in imp or "\\" in imp:
+        return True
+    root = imp.split(".")[0].split("/")[0].lower()
+    return root not in _STDLIB_PREFIXES
+
+
+def _extract_namespace(content: str, ext: str) -> str:
+    """Extract the declared namespace/module from a source file."""
+    if ext == ".cs":
+        # File-scoped: namespace Foo.Bar;
+        m = re.search(r"^namespace\s+([\w.]+)\s*;", content, re.MULTILINE)
+        if m:
+            return m.group(1)
+        # Block-scoped: namespace Foo.Bar {
+        m = re.search(r"^namespace\s+([\w.]+)\s*\{", content, re.MULTILINE)
+        return m.group(1) if m else ""
+    if ext == ".razor":
+        m = re.search(r"^@namespace\s+([\w.]+)", content, re.MULTILINE)
+        return m.group(1) if m else ""
+    return ""
+
+
+def _extract_imports(content: str, ext: str = "") -> set[str]:
     found: set[str] = set()
-    for match in re.findall(r"(?:from|import)\s+([\w./-]+)", content):
-        found.add(match)
-    for match in re.findall(r"import\s+.+?\s+from\s+[\"']([^\"']+)[\"']", content):
-        found.add(match)
+    if ext == ".cs":
+        # using MyApp.Services; / using static MyApp.Utils.Helpers;
+        for m in re.findall(r"^using\s+(?:static\s+)?([\w.]+)\s*;", content, re.MULTILINE):
+            if not _is_external_csharp_namespace(m):
+                found.add(m)
+        return found
+    if ext == ".razor":
+        # @using MyApp.Services
+        for m in re.findall(r"^@using\s+([\w.]+)", content, re.MULTILINE):
+            if not _is_external_csharp_namespace(m):
+                found.add(m)
+        # @inject ServiceType varName  — track the type namespace
+        for m in re.findall(r"^@inject\s+([\w.]+)", content, re.MULTILINE):
+            if not _is_external_csharp_namespace(m):
+                found.add(m)
+        # <ComponentName … /> where ComponentName starts with uppercase
+        for m in re.findall(r"<([A-Z]\w+)[\s/>]", content):
+            found.add(f"__component__{m}")
+        return found
+    # JS/TS: import ... from '...' or require('...')
+    for match in re.findall(r"(?:import|require)\s*(?:[^'\"]*from\s*)?['\"]([^'\"]+)['\"]", content):
+        if _is_internal_import(match):
+            found.add(match)
+    # Python: from X import ... / import X
+    for match in re.findall(r"^\s*(?:from|import)\s+([\w./]+)", content, flags=re.MULTILINE):
+        if _is_internal_import(match):
+            found.add(match)
     return found
 
 
 def _extract_exports(content: str, ext: str) -> set[str]:
     found: set[str] = set()
+
+    if ext == ".cs":
+        # public/internal/protected class|interface|enum|record|struct
+        for name in re.findall(
+            r"(?:public|internal|protected)\s+(?:abstract\s+|sealed\s+|static\s+|partial\s+)*"
+            r"(?:class|interface|enum|record|struct)\s+(\w+)",
+            content,
+            re.MULTILINE,
+        ):
+            found.add(name)
+        return found
+
+    if ext == ".razor":
+        # Component name = filename stem (set in scan loop from file_path)
+        # Parameters exposed via [Parameter]
+        for name in re.findall(r"\[Parameter\]\s*\n\s*public\s+\S+\s+(\w+)", content):
+            found.add(name)
+        # @code block public methods/properties
+        for name in re.findall(r"public\s+(?:async\s+)?(?:\S+\s+)?(\w+)\s*[\({]", content):
+            found.add(name)
+        return found
 
     if ext == ".py":
         for name in re.findall(r"^\s*(?:def|class)\s+(\w+)", content, flags=re.MULTILINE):
@@ -639,175 +761,889 @@ def _prepare_code_summary(files: list[dict]) -> str:
     return "\n".join(summary_lines)
 
 
+def _build_import_graph(files: list[dict]) -> dict[str, list[str]]:
+    """
+    Build a directed graph: file_path -> list of file_paths it imports.
+    Handles:
+      - JS/TS/Python: resolves relative & absolute paths against known files.
+      - C#/.razor: resolves 'using' namespace directives against declared namespaces,
+        links .razor files to their .cs code-behind counterparts, and resolves
+        Razor component references (<ComponentName />) by filename stem.
+    """
+    path_set = {f["file_path"] for f in files}
+
+    # Build namespace → file map for C# files
+    ns_to_file: dict[str, str] = {}
+    for f in files:
+        ns = f.get("namespace", "")
+        if ns:
+            ns_to_file[ns] = f["file_path"]
+
+    # Build component-name → file map for .razor files (stem = component name)
+    razor_name_to_file: dict[str, str] = {
+        Path(f["file_path"]).stem: f["file_path"]
+        for f in files
+        if f["file_type"] == ".razor"
+    }
+
+    def resolve_js_py(importing_file: str, raw_import: str) -> str | None:
+        base_dir = str(Path(importing_file).parent)
+        candidates = []
+        if raw_import.startswith("."):
+            joined = (Path(base_dir) / raw_import).as_posix()
+            candidates.append(joined)
+        else:
+            candidates.append(raw_import)
+
+        for cand in candidates:
+            if cand in path_set:
+                return cand
+            for ext in (".ts", ".tsx", ".js", ".jsx", ".py"):
+                if (cand + ext) in path_set:
+                    return cand + ext
+                index = cand.rstrip("/") + "/index" + ext
+                if index in path_set:
+                    return index
+            if "." in cand and "/" not in cand:
+                as_path = cand.replace(".", "/") + ".py"
+                if as_path in path_set:
+                    return as_path
+        return None
+
+    def resolve_csharp(importing_file: str, raw: str) -> str | None:
+        # Component reference marker from Razor (e.g. __component__NavMenu)
+        if raw.startswith("__component__"):
+            name = raw[len("__component__"):]
+            return razor_name_to_file.get(name)
+
+        # Exact namespace match
+        if raw in ns_to_file:
+            target = ns_to_file[raw]
+            return target if target != importing_file else None
+
+        # Prefix match: 'using MyApp.Services' matches namespace 'MyApp.Services.Auth'
+        best: str | None = None
+        for ns, fp in ns_to_file.items():
+            if fp == importing_file:
+                continue
+            if ns.startswith(raw + ".") or raw.startswith(ns + "."):
+                # Pick the most specific match
+                if best is None or len(ns) > len(ns_to_file.get(best, "")):
+                    best = fp
+        return best
+
+    graph: dict[str, list[str]] = {}
+    for f in files:
+        ext = f["file_type"]
+        resolved: list[str] = []
+
+        if ext in (".cs", ".razor"):
+            for raw in f.get("imports", []):
+                target = resolve_csharp(f["file_path"], raw)
+                if target and target not in resolved:
+                    resolved.append(target)
+            # Link .razor to its .cs code-behind (MyPage.razor ↔ MyPage.razor.cs)
+            if ext == ".razor":
+                codebehind = f["file_path"] + ".cs"
+                if codebehind in path_set and codebehind not in resolved:
+                    resolved.append(codebehind)
+        else:
+            for raw in f.get("imports", []):
+                target = resolve_js_py(f["file_path"], raw)
+                if target and target != f["file_path"] and target not in resolved:
+                    resolved.append(target)
+
+        graph[f["file_path"]] = resolved
+
+    return graph
+
+
+def _find_entry_points(files: list[dict], graph: dict[str, list[str]]) -> list[str]:
+    """
+    Heuristically find entry-point files.
+    Priority:
+      1. C#/Blazor: Program.cs → Startup.cs → App.razor
+      2. Other languages: common entry-point names (main, index, app, server)
+      3. Graph roots: files not imported by any other file
+    """
+    ENTRY_NAMES = {
+        # C# / Blazor
+        "program.cs", "startup.cs", "app.razor",
+        # Web/JS
+        "main.py", "index.ts", "index.tsx", "index.js", "app.py",
+        "server.py", "server.ts", "app.ts", "app.tsx",
+        # Generic
+        "main", "index", "app", "server", "entry", "client",
+    }
+    all_paths = [f["file_path"] for f in files]
+    imported_by_others: set[str] = set()
+    for targets in graph.values():
+        imported_by_others.update(targets)
+
+    # Named entries first (ordered by priority)
+    entry_points: list[str] = []
+    for priority_name in ["program.cs", "startup.cs", "app.razor"]:
+        for p in all_paths:
+            if Path(p).name.lower() == priority_name and p not in entry_points:
+                entry_points.append(p)
+
+    for p in all_paths:
+        name = Path(p).name.lower()
+        stem = Path(p).stem.lower()
+        if (name in ENTRY_NAMES or stem in ENTRY_NAMES) and p not in entry_points:
+            entry_points.append(p)
+
+    # Blazor @page components as secondary entry points
+    for f in files:
+        if f.get("is_page") and f["file_path"] not in entry_points:
+            entry_points.append(f["file_path"])
+
+    # Graph roots (not imported by anyone)
+    for p in all_paths:
+        if p not in imported_by_others and p not in entry_points:
+            entry_points.append(p)
+
+    return entry_points or all_paths[:1]
+
+
+def _trace_flow(start: str, graph: dict[str, list[str]], max_depth: int = 8) -> list[str]:
+    """BFS from start following the import graph, returning the visited path."""
+    visited: list[str] = []
+    queue = [start]
+    seen: set[str] = {start}
+    while queue and len(visited) < max_depth:
+        node = queue.pop(0)
+        visited.append(node)
+        for dep in graph.get(node, []):
+            if dep not in seen:
+                seen.add(dep)
+                queue.append(dep)
+    return visited
+
+
 def _generate_dataflows(files: list[dict], ai_insights: dict | None) -> list[dict]:
-    """Generate data flow paths, optionally using AI insights."""
+    """Generate named data flow paths with human-readable steps."""
     flows = []
-    
+
     if ai_insights and "data_flows" in ai_insights:
-        # Use AI-identified flows
         for flow in ai_insights.get("data_flows", [])[:3]:
             if isinstance(flow, dict):
                 flows.append({
                     "name": flow.get("name", "AI-Identified Flow"),
-                    "start": flow.get("start", files[0]["file_path"] if files else "entry"),
-                    "end": flow.get("end", files[-1]["file_path"] if files else "exit"),
+                    "start": flow.get("start", ""),
+                    "end": flow.get("end", ""),
                     "steps": flow.get("steps", []),
                     "description": flow.get("description", ""),
                 })
-            else:
-                # flow is a string
-                flows.append({
-                    "name": "Data Flow",
-                    "start": files[0]["file_path"] if files else "entry",
-                    "end": files[-1]["file_path"] if files else "exit",
-                    "steps": [],
-                    "description": str(flow),
-                })
-    
-    # Always add a primary flow based on file structure
-    if files:
-        flows.append({
-            "name": "Primary Data Flow",
-            "start": files[0]["file_path"],
-            "end": files[-1]["file_path"],
-            "steps": [f["file_path"] for f in files[1:6]],
-            "description": f"Flow from {files[0]['file_path']} to {files[-1]['file_path']}",
-        })
+
+    if not files:
+        flows.append({"name": "No files", "start": "Browser", "end": "Server", "steps": [], "description": "No source files found"})
+        return flows
+
+    if _is_dotnet_project(files):
+        flows.extend(_generate_blazor_dataflows(files))
     else:
-        flows.append({
-            "name": "Primary Data Flow",
-            "start": "entry",
-            "end": "exit",
-            "steps": [],
-            "description": "No files to analyze",
-        })
-    
+        flows.extend(_generate_generic_dataflows(files))
+
     return flows
 
 
+def _generate_blazor_dataflows(files: list[dict]) -> list[dict]:
+    """Generate semantic data flow descriptions for Blazor Server applications."""
+    from collections import defaultdict
+    flows = []
+
+    layer_files: defaultdict[str, list[dict]] = defaultdict(list)
+    for f in files:
+        layer_files[_classify_blazor_file(f)].append(f)
+
+    pages    = layer_files.get("Pages", [])
+    services = layer_files.get("Services", [])
+    data_ctx = layer_files.get("Data / DbContext", [])
+    models   = layer_files.get("Models / Entities", [])
+    shell    = layer_files.get("App Shell", [])
+    shared   = layer_files.get("Shared / Layout", [])
+    comps    = layer_files.get("Components", [])
+    hubs     = layer_files.get("SignalR Hubs", [])
+    entry    = layer_files.get("Entry Point", [])
+
+    graph = _build_import_graph(files)
+
+    # ── Flow 1: Full User Request → Render cycle ──────────────────────────
+    request_steps = [
+        "Browser sends HTTP request to ASP.NET Core Kestrel server",
+        "ASP.NET Core middleware pipeline processes the request (auth, routing, etc.)",
+    ]
+    if entry:
+        request_steps.append(f"{Path(entry[0]['file_path']).name} configures services and the HTTP pipeline")
+    if shell:
+        app_razor = next((f for f in shell if Path(f["file_path"]).name.lower() == "app.razor"), shell[0])
+        request_steps.append(f"{Path(app_razor['file_path']).name} Router matches URL and selects the target Page")
+    if shared:
+        layout = next((f for f in shared if "layout" in f["file_path"].lower()), shared[0])
+        request_steps.append(f"{Path(layout['file_path']).name} renders the page shell (nav, header, etc.)")
+    if pages:
+        request_steps.append(f"Target Page component (e.g. {Path(pages[0]['file_path']).name}) initialises via OnInitializedAsync")
+    if services:
+        request_steps.append(f"Page calls injected service (e.g. {Path(services[0]['file_path']).name}) to load data")
+    if data_ctx:
+        request_steps.append(f"{Path(data_ctx[0]['file_path']).name} executes a parameterised SQL query against the database")
+    if models:
+        request_steps.append(f"Query results are mapped to {Path(models[0]['file_path']).name} model objects")
+    if pages:
+        request_steps.append("Model data is bound to component properties and Razor markup re-renders")
+    request_steps.append("Blazor Server pushes the minimal HTML diff back to the browser over SignalR WebSocket")
+
+    flows.append({
+        "name": "User Request → Page Render",
+        "start": "Browser (HTTP Request)",
+        "end": "Browser (Rendered HTML via SignalR)",
+        "steps": request_steps,
+        "description": "Complete lifecycle of a page load in Blazor Server: from HTTP request through the circuit, data retrieval, and DOM update.",
+    })
+
+    # ── Flow 2: User Interaction / Event ──────────────────────────────────
+    if pages or comps:
+        event_target = pages[0] if pages else comps[0]
+        event_steps = [
+            "User interacts with a DOM element (e.g. button click, form input)",
+            "Browser sends the event payload to the server over the existing SignalR WebSocket",
+            f"{Path(event_target['file_path']).name} receives the event in the corresponding C# event handler (e.g. OnClick, OnValidSubmit)",
+        ]
+        if services:
+            event_steps.append(f"Handler calls {Path(services[0]['file_path']).name} to perform business logic or persist data")
+        if data_ctx:
+            event_steps.append(f"{Path(data_ctx[0]['file_path']).name} executes INSERT / UPDATE / DELETE via EF Core")
+            event_steps.append("EF Core wraps the operation in a transaction and calls SaveChangesAsync()")
+        event_steps.append("Component state is updated; StateHasChanged() may be called explicitly")
+        event_steps.append("Blazor diffs the new render tree against the previous one")
+        event_steps.append("Only the changed DOM nodes are pushed to the browser over SignalR")
+
+        flows.append({
+            "name": "User Interaction → State Update",
+            "start": "Browser DOM Event",
+            "end": "Browser DOM Update (SignalR diff)",
+            "steps": event_steps,
+            "description": "How a user event (click, form submit) travels through the Blazor circuit, triggers business logic, persists data, and updates the UI.",
+        })
+
+    # ── Flow 3: Dependency Injection / Service Wiring ─────────────────────
+    if services or data_ctx:
+        di_steps = [
+            "ASP.NET Core DI container is configured in Program.cs (AddDbContext, AddScoped, AddSingleton, etc.)",
+        ]
+        if data_ctx:
+            di_steps.append(f"{Path(data_ctx[0]['file_path']).name} is registered via builder.Services.AddDbContext<>() with the connection string from configuration")
+        for svc in services[:3]:
+            di_steps.append(f"{Path(svc['file_path']).name} is registered as a scoped or transient service")
+        di_steps.append("When a Blazor component is instantiated, the DI container resolves all @inject dependencies")
+        di_steps.append("Services are constructed with their own dependencies injected transitively")
+        if data_ctx:
+            di_steps.append("DbContext lifetime is scoped to the Blazor circuit (one per SignalR connection)")
+
+        flows.append({
+            "name": "Dependency Injection Wiring",
+            "start": "Program.cs (Service Registration)",
+            "end": "Component (@inject resolved)",
+            "steps": di_steps,
+            "description": "How services and DbContext are registered in the DI container and injected into Blazor components at runtime.",
+        })
+
+    # ── Flow 4: Component → Child Component data passing ──────────────────
+    if comps and pages:
+        param_steps = [
+            f"Parent page (e.g. {Path(pages[0]['file_path']).name}) renders a child component via Razor markup",
+            "Parent passes data to child via [Parameter] properties in the component's attribute syntax",
+            f"Child component (e.g. {Path(comps[0]['file_path']).name}) receives parameters and renders its own Razor markup",
+            "If a child needs to communicate back, it exposes an EventCallback<T> parameter",
+            "Parent wires the EventCallback to a local method (e.g. @bind-Value or @onchange)",
+            "Blazor reconciles the component tree top-down, only re-rendering components whose parameters changed",
+        ]
+        flows.append({
+            "name": "Parent → Child Component Data Flow",
+            "start": f"Page Component ({Path(pages[0]['file_path']).name})",
+            "end": f"Child Component ({Path(comps[0]['file_path']).name})",
+            "steps": param_steps,
+            "description": "How data is passed down the Blazor component hierarchy using [Parameter] properties and EventCallback for upward communication.",
+        })
+
+    # ── Flow 5: SignalR Hub (if present) ──────────────────────────────────
+    if hubs:
+        hub_steps = [
+            "Client JavaScript calls HubConnection.invoke() with a method name and payload",
+            "SignalR routes the call to the matching method on the Hub class on the server",
+            f"{Path(hubs[0]['file_path']).name} processes the message (validates, computes, or stores)",
+        ]
+        if services:
+            hub_steps.append(f"Hub delegates business logic to injected {Path(services[0]['file_path']).name}")
+        hub_steps.append("Hub calls Clients.All.SendAsync() / Clients.Caller.SendAsync() to push data back")
+        hub_steps.append("Client-side JavaScript handler receives the broadcast and updates the UI")
+
+        flows.append({
+            "name": "SignalR Hub Message Flow",
+            "start": "Browser (HubConnection.invoke)",
+            "end": "Browser (HubConnection.on callback)",
+            "steps": hub_steps,
+            "description": f"Real-time bidirectional data flow through {Path(hubs[0]['file_path']).name}.",
+        })
+
+    return flows
+
+
+def _generate_generic_dataflows(files: list[dict]) -> list[dict]:
+    """Generate data flows for non-.NET projects using the import graph."""
+    flows = []
+    graph = _build_import_graph(files)
+    entries = _find_entry_points(files, graph)
+
+    for entry in entries[:3]:
+        chain = _trace_flow(entry, graph)
+        if len(chain) < 2:
+            continue
+        step_descs = []
+        for fp in chain[1:]:
+            step_descs.append(f"{Path(fp).name} — imported by {Path(chain[chain.index(fp) - 1]).name}")
+        flows.append({
+            "name": f"Flow from {Path(entry).name}",
+            "start": Path(chain[0]).name,
+            "end": Path(chain[-1]).name,
+            "steps": step_descs,
+            "description": f"Import chain starting at {entry}, traversing {len(chain)} modules.",
+        })
+
+    if not flows and files:
+        chain = [f["file_path"] for f in files[:6]]
+        flows.append({
+            "name": "Module Listing",
+            "start": Path(chain[0]).name,
+            "end": Path(chain[-1]).name,
+            "steps": [Path(fp).name for fp in chain[1:-1]],
+            "description": "No resolvable import chain found; listing top-level files.",
+        })
+
+    return flows
+
+
+def _classify_blazor_file(f: dict) -> str:
+    """
+    Return a logical Blazor layer name for a file based on path conventions.
+    """
+    p = f["file_path"].lower()
+    name = Path(f["file_path"]).name.lower()
+    ext = f["file_type"]
+
+    if name in ("program.cs", "startup.cs"):
+        return "Entry Point"
+    if name in ("app.razor", "_imports.razor", "_host.cshtml"):
+        return "App Shell"
+    if "/pages/" in p or p.startswith("pages/"):
+        return "Pages"
+    if "/shared/" in p or p.startswith("shared/") or "/layout" in p:
+        return "Shared / Layout"
+    if "/components/" in p or p.startswith("components/"):
+        return "Components"
+    if "/services/" in p or p.startswith("services/"):
+        return "Services"
+    if "/data/" in p or p.startswith("data/") or "/dbcontext" in p:
+        return "Data / DbContext"
+    if "/models/" in p or p.startswith("models/") or "/entities/" in p:
+        return "Models / Entities"
+    if "/controllers/" in p or p.startswith("controllers/"):
+        return "Controllers"
+    if "/hubs/" in p or p.startswith("hubs/"):
+        return "SignalR Hubs"
+    if "/middleware/" in p or p.startswith("middleware/"):
+        return "Middleware"
+    if f.get("is_page"):
+        return "Pages"
+    if ext == ".razor":
+        return "Components"
+    if ext == ".cs":
+        return "Services"
+    # Fall back to top-level directory name
+    parts = Path(f["file_path"]).parts
+    return parts[0] if len(parts) > 1 else "Root"
+
+
+def _is_dotnet_project(files: list[dict]) -> bool:
+    return any(f["file_type"] in (".cs", ".razor") for f in files)
+
+
 def _generate_component_diagram(files: list[dict], ai_insights: dict | None = None) -> str:
+    """
+    For Blazor/C# projects: group files by logical layer (Pages, Components,
+    Services, Data, etc.) and draw dependency edges between layers.
+    For other projects: group by top-level directory.
+    """
+    from collections import defaultdict
     lines = ["graph TB"]
-    nodes = []
-    
-    # Add AI-identified main components if available
-    if ai_insights and "main_components" in ai_insights:
-        for component in ai_insights.get("main_components", [])[:10]:
-            comp_id = _sanitize_mermaid_id(component)
-            safe_label = component.replace('"', '')
-            lines.append(f'  {comp_id}["{safe_label}"]')
-            nodes.append(comp_id)
-    
-    # Add file-based components (limit to avoid huge graphs)
-    for idx, f in enumerate(files[:20]):
-        if len(nodes) >= 20:
-            break
-        node = _sanitize_mermaid_id(f["file_path"])
-        label = Path(f["file_path"]).name
-        lines.append(f'  {node}["{label}"]')
-        nodes.append(node)
-    
-    # Add some connections between nodes
-    for i in range(min(len(nodes) - 1, 10)):
-        lines.append(f"  {nodes[i]} --> {nodes[i + 1]}")
-    
+
+    if _is_dotnet_project(files):
+        # Blazor-aware grouping
+        layer_files: defaultdict[str, list[str]] = defaultdict(list)
+        for f in files:
+            layer = _classify_blazor_file(f)
+            layer_files[layer].append(f["file_path"])
+
+        # Preferred display order
+        layer_order = [
+            "Entry Point", "App Shell", "Pages", "Shared / Layout",
+            "Components", "Services", "Data / DbContext", "Models / Entities",
+            "Controllers", "SignalR Hubs", "Middleware",
+        ]
+        remaining = [l for l in layer_files if l not in layer_order]
+        ordered_layers = [l for l in layer_order if l in layer_files] + remaining
+
+        layer_node: dict[str, str] = {}
+        for layer in ordered_layers:
+            fps = layer_files[layer]
+            node_id = _sanitize_mermaid_id(layer)
+            layer_node[layer] = node_id
+            file_names = ", ".join(Path(p).name for p in fps[:3])
+            if len(fps) > 3:
+                file_names += f" +{len(fps) - 3} more"
+            safe_label = f"{layer}\\n({file_names})".replace('"', "'")
+            lines.append(f'  {node_id}["{safe_label}"]')
+
+        # Edges from import graph between layers
+        graph = _build_import_graph(files)
+        file_to_layer = {fp: layer for layer, fps in layer_files.items() for fp in fps}
+        edges_added: set[tuple[str, str]] = set()
+        for src_file, deps in graph.items():
+            src_layer = file_to_layer.get(src_file)
+            for dep_file in deps:
+                dst_layer = file_to_layer.get(dep_file)
+                if src_layer and dst_layer and src_layer != dst_layer:
+                    edge = (layer_node[src_layer], layer_node[dst_layer])
+                    if edge not in edges_added:
+                        lines.append(f"  {edge[0]} --> {edge[1]}")
+                        edges_added.add(edge)
+
+    else:
+        # Generic: group by top-level directory
+        dir_groups: defaultdict[str, list[str]] = defaultdict(list)
+        for f in files:
+            p = Path(f["file_path"])
+            top = p.parts[0] if len(p.parts) > 1 else "root"
+            dir_groups[top].append(f["file_path"])
+
+        dir_node: dict[str, str] = {}
+        for grp in sorted(dir_groups):
+            node_id = _sanitize_mermaid_id(grp)
+            dir_node[grp] = node_id
+            file_names = ", ".join(Path(p).name for p in dir_groups[grp][:3])
+            if len(dir_groups[grp]) > 3:
+                file_names += f" +{len(dir_groups[grp]) - 3} more"
+            safe_label = f"{grp}\\n({file_names})".replace('"', "'")
+            lines.append(f'  {node_id}["{safe_label}"]')
+
+        if ai_insights and "main_components" in ai_insights:
+            for component in ai_insights.get("main_components", [])[:5]:
+                comp_id = _sanitize_mermaid_id(component)
+                if comp_id not in dir_node.values():
+                    lines.append(f'  {comp_id}["{component.replace(chr(34), chr(39))}"]')
+
+        graph = _build_import_graph(files)
+        file_to_group = {fp: grp for grp, fps in dir_groups.items() for fp in fps}
+        edges_added: set[tuple[str, str]] = set()
+        for src_file, deps in graph.items():
+            src_grp = file_to_group.get(src_file)
+            for dep_file in deps:
+                dst_grp = file_to_group.get(dep_file)
+                if src_grp and dst_grp and src_grp != dst_grp:
+                    edge = (dir_node[src_grp], dir_node[dst_grp])
+                    if edge not in edges_added:
+                        lines.append(f"  {edge[0]} --> {edge[1]}")
+                        edges_added.add(edge)
+
+    if len(lines) == 1:
+        lines.append('  A["No source files found"]')
+
     return "\n".join(lines)
 
 
 def _generate_class_diagram(files: list[dict], ai_insights: dict | None = None) -> str:
+    """
+    Build a class/component diagram grouped by file.
+    For .cs files: shows classes/interfaces.
+    For .razor files: shows the component name and its parameters.
+    Draw dependency arrows between modules via the import graph.
+    """
     lines = ["classDiagram"]
-    
-    # Add classes from exported items
+
+    file_symbols: dict[str, list[str]] = {}
     class_count = 0
-    for f in files[:15]:
-        for symbol in f.get("exported_items", [])[:3]:
-            if class_count >= 15:
-                break
-            safe_symbol = re.sub(r'[^a-zA-Z0-9_]', '', symbol)
-            if safe_symbol:
-                lines.append(f"  class {safe_symbol}")
-                class_count += 1
-        if class_count >= 15:
+    for f in files[:25]:
+        if class_count >= 30:
             break
-    
-    # Add some relationships if we have AI insights
-    if ai_insights and "main_components" in ai_insights and len(lines) > 1:
-        components = ai_insights.get("main_components", [])[:3]
-        if len(components) > 1:
-            for i in range(len(components) - 1):
-                src = re.sub(r'[^a-zA-Z0-9_]', '', components[i])
-                dst = re.sub(r'[^a-zA-Z0-9_]', '', components[i + 1])
-                if src and dst:
-                    lines.append(f"  {src} --> {dst}")
-    
+        symbols = []
+        if f["file_type"] == ".razor":
+            # Component name = stem
+            comp_name = re.sub(r'[^a-zA-Z0-9_]', '_', Path(f["file_path"]).stem)
+            if comp_name:
+                symbols = [comp_name]
+                lines.append(f"  class {comp_name} {{")
+                if f.get("is_page"):
+                    lines.append("    <<Page>>")
+                else:
+                    lines.append("    <<Component>>")
+                for sym in f.get("exported_items", [])[:4]:
+                    safe = re.sub(r'[^a-zA-Z0-9_]', '', sym)
+                    if safe:
+                        lines.append(f"    +{safe}()")
+                lines.append("  }")
+                class_count += 1
+        else:
+            for symbol in f.get("exported_items", [])[:5]:
+                if class_count >= 30:
+                    break
+                safe = re.sub(r'[^a-zA-Z0-9_]', '', symbol)
+                if safe:
+                    symbols.append(safe)
+                    class_count += 1
+            if symbols:
+                module_name = re.sub(r'[^a-zA-Z0-9_]', '_', Path(f["file_path"]).stem)
+                if not module_name[0:1].isalpha():
+                    module_name = "M_" + module_name
+                lines.append(f"  class {module_name} {{")
+                for sym in symbols:
+                    lines.append(f"    +{sym}()")
+                lines.append("  }")
+        if symbols:
+            file_symbols[f["file_path"]] = symbols
+
+    # Draw relationships via import graph
+    graph = _build_import_graph(files)
+
+    def module_name_for(fp: str) -> str:
+        f_obj = next((x for x in files if x["file_path"] == fp), None)
+        if f_obj and f_obj["file_type"] == ".razor":
+            return re.sub(r'[^a-zA-Z0-9_]', '_', Path(fp).stem)
+        name = re.sub(r'[^a-zA-Z0-9_]', '_', Path(fp).stem)
+        return name if name[0:1].isalpha() else "M_" + name
+
+    edges_added: set[tuple[str, str]] = set()
+    for src_file, deps in graph.items():
+        if src_file not in file_symbols:
+            continue
+        src_mod = module_name_for(src_file)
+        for dep_file in deps:
+            if dep_file not in file_symbols:
+                continue
+            dst_mod = module_name_for(dep_file)
+            if src_mod != dst_mod:
+                edge = (src_mod, dst_mod)
+                if edge not in edges_added:
+                    lines.append(f"  {src_mod} --> {dst_mod}")
+                    edges_added.add(edge)
+
     if len(lines) == 1:
-        lines.append("  class NoExports")
-    
+        lines.append("  class NoExportedSymbols")
+
     return "\n".join(lines)
 
 
 def _generate_dependency_diagram(files: list[dict], ai_insights: dict | None = None) -> str:
+    """
+    Draw a file-level dependency graph using the resolved import graph.
+    Only nodes that participate in at least one edge are shown.
+    """
     lines = ["graph LR"]
+    graph = _build_import_graph(files)
+
     nodes_added: set[str] = set()
-    edges: set[str] = set()
-    
-    # Add file-based dependencies (limited)
+    edges: list[str] = []
     edge_count = 0
-    for f in files[:20]:
-        if edge_count >= 25:
-            break
-        src = _sanitize_mermaid_id(f["file_path"])
-        src_label = Path(f["file_path"]).name
-        
-        for imp in f.get("imports", [])[:2]:
-            if edge_count >= 25:
+
+    for src_file, deps in graph.items():
+        if not deps or edge_count >= 30:
+            continue
+        src_id = _sanitize_mermaid_id(src_file)
+        src_label = Path(src_file).name.replace('"', "'")
+        for dep_file in deps:
+            if edge_count >= 30:
                 break
-            dst = _sanitize_mermaid_id(imp)
-            if src and dst and src != dst:
-                if src not in nodes_added:
-                    lines.append(f'  {src}["{src_label}"]')
-                    nodes_added.add(src)
-                if dst not in nodes_added:
-                    lines.append(f'  {dst}["{dst[:20]}"]')
-                    nodes_added.add(dst)
-                edges.add(f"  {src} --> {dst}")
-                edge_count += 1
-    
-    lines.extend(sorted(edges))
-    if len(lines) == 1:
-        lines.append("  A[No dependencies]")
-        lines.append("  B[Check source files]")
+            dst_id = _sanitize_mermaid_id(dep_file)
+            dst_label = Path(dep_file).name.replace('"', "'")
+            if src_id == dst_id:
+                continue
+            if src_id not in nodes_added:
+                lines.append(f'  {src_id}["{src_label}"]')
+                nodes_added.add(src_id)
+            if dst_id not in nodes_added:
+                lines.append(f'  {dst_id}["{dst_label}"]')
+                nodes_added.add(dst_id)
+            edges.append(f"  {src_id} --> {dst_id}")
+            edge_count += 1
+
+    lines.extend(edges)
+
+    if len(nodes_added) == 0:
+        lines.append('  A["No internal dependencies found"]')
+        lines.append('  B["All imports are external libraries"]')
         lines.append("  A --> B")
 
     return "\n".join(lines)
 
 
-def _generate_flowchart_diagram(files: list[dict], ai_insights: dict | None = None) -> str:
+def _get_edge_label(src_layer: str, dst_layer: str) -> str:
+    """Return a meaningful edge label based on the source and destination layer."""
+    label_map: dict[tuple[str, str], str] = {
+        ("Entry Point",        "App Shell"):           "starts",
+        ("Entry Point",        "Services"):            "registers DI",
+        ("Entry Point",        "Middleware"):          "configures",
+        ("App Shell",          "Pages"):               "routes to",
+        ("App Shell",          "Shared / Layout"):     "renders",
+        ("Shared / Layout",    "Pages"):               "hosts",
+        ("Shared / Layout",    "Components"):          "renders",
+        ("Pages",              "Components"):          "contains",
+        ("Pages",              "Services"):            "@inject",
+        ("Pages",              "Shared / Layout"):     "uses",
+        ("Components",         "Services"):            "@inject",
+        ("Components",         "Components"):          "renders",
+        ("Services",           "Data / DbContext"):    "queries",
+        ("Services",           "Models / Entities"):   "maps",
+        ("Data / DbContext",   "Models / Entities"):   "returns",
+        ("Controllers",        "Services"):            "calls",
+        ("SignalR Hubs",       "Services"):            "uses",
+        ("Middleware",         "App Shell"):           "passes to",
+    }
+    return label_map.get((src_layer, dst_layer), "uses")
+
+
+def _generate_blazor_flowchart(files: list[dict], ai_insights: dict | None) -> str:
+    """
+    Generate a detailed Mermaid flowchart for Blazor Server / ASP.NET Core projects.
+    Uses subgraphs for each logical layer with labelled edges.
+    """
+    from collections import defaultdict
+
+    # Build per-layer file lists
+    layer_files: defaultdict[str, list[dict]] = defaultdict(list)
+    for f in files:
+        layer = _classify_blazor_file(f)
+        layer_files[layer].append(f)
+
+    # Layer → subgraph id mapping (only include layers that have files)
+    layer_sg_id: dict[str, str] = {}
+    for layer in layer_files:
+        layer_sg_id[layer] = _sanitize_mermaid_id("sg_" + layer)
+
+    # Node counter
+    node_counter = [0]
+    node_ids: dict[str, str] = {}
+
+    def nid(fp: str) -> str:
+        if fp not in node_ids:
+            node_ids[fp] = f"n{node_counter[0]}"
+            node_counter[0] += 1
+        return node_ids[fp]
+
+    def node_label(f: dict) -> str:
+        stem = Path(f["file_path"]).stem
+        label = stem.replace('"', "'")
+        if f.get("is_page"):
+            # Find @page directive to add route
+            return label
+        return label
+
     lines = ["flowchart TD"]
 
-    if not files:
-        lines.append("  start([No source files found])")
-        lines.append("  start --> end([Upload a codebase])")
-        return "\n".join(lines)
+    # Check if it's a Blazor Server project (has SignalR / circuit concept)
+    has_hub = bool(layer_files.get("SignalR Hubs"))
+    has_data = bool(layer_files.get("Data / DbContext"))
+    has_services = bool(layer_files.get("Services"))
 
-    # Create a flow from files
-    chain = files[:10]
-    for idx, file_info in enumerate(chain):
-        node_id = f"n{idx}"
-        label = Path(file_info["file_path"]).name
-        label = label.replace('"', '')
-        lines.append(f'  {node_id}["{label}"]')
+    # --- Browser layer (always present for web apps) ---
+    lines.append("")
+    lines.append("  subgraph sg_browser[\"Browser\"]")
+    lines.append("    direction LR")
+    lines.append("    n_user[\"User Action\"]")
+    lines.append("  end")
 
-    for idx in range(len(chain) - 1):
-        lines.append(f"  n{idx} --> n{idx + 1}")
+    # --- Blazor circuit layer ---
+    circuit_layers = ["Entry Point", "App Shell", "Shared / Layout", "Pages", "Components"]
+    circuit_layers_present = [l for l in circuit_layers if l in layer_files]
 
-    # Add architecture pattern if available
-    if ai_insights and "architecture_pattern" in ai_insights and len(chain) > 0:
-        pattern = ai_insights.get("architecture_pattern", "Unknown")
-        pattern = pattern.replace('"', '').replace("'", '')
-        lines.append(f'  pattern["{pattern} Pattern"]')
-        lines.append("  n0 --> pattern")
+    if circuit_layers_present:
+        lines.append("")
+        lines.append("  subgraph sg_circuit[\"Blazor Server Circuit\"]")
+        lines.append("    direction TB")
+        for layer in circuit_layers_present:
+            sg = layer_sg_id[layer]
+            safe_label = layer.replace('"', "'")
+            lines.append(f"    subgraph {sg}[\"{safe_label}\"]")
+            for f in layer_files[layer][:6]:
+                n = nid(f["file_path"])
+                lbl = node_label(f)
+                if f.get("is_page"):
+                    lines.append(f"      {n}([\"{lbl}\"])")
+                elif f["file_type"] == ".razor":
+                    lines.append(f"      {n}[\"{lbl}\"]")
+                else:
+                    lines.append(f"      {n}[\"{lbl}\"]")
+            lines.append("    end")
+        lines.append("  end")
+
+    # --- Middleware layer ---
+    if "Middleware" in layer_files:
+        lines.append("")
+        sg = layer_sg_id["Middleware"]
+        lines.append(f"  subgraph {sg}[\"Middleware\"]")
+        for f in layer_files["Middleware"][:4]:
+            lines.append(f"    {nid(f['file_path'])}[\"{node_label(f)}\"]")
+        lines.append("  end")
+
+    # --- Service layer ---
+    if has_services:
+        lines.append("")
+        sg = layer_sg_id["Services"]
+        lines.append(f"  subgraph {sg}[\"Service Layer\"]")
+        for f in layer_files["Services"][:8]:
+            lines.append(f"    {nid(f['file_path'])}[\"{node_label(f)}\"]")
+        lines.append("  end")
+
+    # --- SignalR Hubs ---
+    if has_hub:
+        lines.append("")
+        sg = layer_sg_id["SignalR Hubs"]
+        lines.append(f"  subgraph {sg}[\"SignalR Hubs\"]")
+        for f in layer_files["SignalR Hubs"][:4]:
+            lines.append(f"    {nid(f['file_path'])}[\"{node_label(f)}\"]")
+        lines.append("  end")
+
+    # --- Controllers ---
+    if "Controllers" in layer_files:
+        lines.append("")
+        sg = layer_sg_id["Controllers"]
+        lines.append(f"  subgraph {sg}[\"Controllers\"]")
+        for f in layer_files["Controllers"][:6]:
+            lines.append(f"    {nid(f['file_path'])}[\"{node_label(f)}\"]")
+        lines.append("  end")
+
+    # --- Data layer ---
+    if has_data or "Models / Entities" in layer_files:
+        lines.append("")
+        lines.append("  subgraph sg_data[\"Data Layer\"]")
+        lines.append("    direction LR")
+        for f in layer_files.get("Data / DbContext", [])[:4]:
+            lines.append(f"    {nid(f['file_path'])}[\"{node_label(f)}\"]")
+        for f in layer_files.get("Models / Entities", [])[:5]:
+            lines.append(f"    {nid(f['file_path'])}[\"{node_label(f)}\"]")
+        if has_data:
+            lines.append("    n_db[(\"Database\")]")
+        lines.append("  end")
+
+    # --- Edges ---
+    lines.append("")
+
+    # Browser → first entry or app shell
+    first_circuit = None
+    for layer in ["Entry Point", "App Shell"]:
+        if layer in layer_files:
+            first_circuit = nid(layer_files[layer][0]["file_path"])
+            break
+
+    if first_circuit:
+        lines.append(f"  n_user -->|\"HTTP / SignalR\"| {first_circuit}")
+
+    # Import-graph edges between files with labels
+    graph = _build_import_graph(files)
+    file_to_layer = {f["file_path"]: _classify_blazor_file(f) for f in files}
+    edges_added: set[tuple[str, str]] = set()
+    edge_count = 0
+
+    for src_file, deps in graph.items():
+        if src_file not in node_ids:
+            continue
+        src_layer = file_to_layer.get(src_file, "")
+        for dep_file in deps:
+            if dep_file not in node_ids:
+                continue
+            dst_layer = file_to_layer.get(dep_file, "")
+            src_id = nid(src_file)
+            dst_id = nid(dep_file)
+            edge = (src_id, dst_id)
+            if edge not in edges_added and edge_count < 35:
+                label = _get_edge_label(src_layer, dst_layer)
+                lines.append(f"  {src_id} -->|\"{label}\"| {dst_id}")
+                edges_added.add(edge)
+                edge_count += 1
+
+    # DbContext → Database node
+    if has_data:
+        for f in layer_files.get("Data / DbContext", [])[:1]:
+            lines.append(f"  {nid(f['file_path'])} -->|\"executes SQL\"| n_db")
 
     return "\n".join(lines)
+
+
+def _generate_generic_flowchart(files: list[dict], ai_insights: dict | None) -> str:
+    """Generic flowchart for non-.NET projects: BFS from entry points with labelled edges."""
+    lines = ["flowchart TD"]
+
+    graph = _build_import_graph(files)
+    entries = _find_entry_points(files, graph)
+
+    node_ids: dict[str, str] = {}
+    node_counter = [0]
+
+    def get_node_id(fp: str) -> str:
+        if fp not in node_ids:
+            node_ids[fp] = f"n{node_counter[0]}"
+            node_counter[0] += 1
+        return node_ids[fp]
+
+    all_edges: list[tuple[str, str]] = []
+    visited_global: set[str] = set()
+
+    for entry in entries[:2]:
+        chain = _trace_flow(entry, graph, max_depth=10)
+        for fp in chain:
+            visited_global.add(fp)
+        for i in range(len(chain) - 1):
+            all_edges.append((chain[i], chain[i + 1]))
+
+    for fp in visited_global:
+        nid_val = get_node_id(fp)
+        label = Path(fp).name.replace('"', "'")
+        if fp in entries:
+            lines.append(f'  {nid_val}(["{label}"])')
+        else:
+            lines.append(f'  {nid_val}["{label}"]')
+
+    seen_edges: set[tuple[str, str]] = set()
+    for src, dst in all_edges:
+        src_id = get_node_id(src)
+        dst_id = get_node_id(dst)
+        if (src_id, dst_id) not in seen_edges:
+            lines.append(f"  {src_id} --> {dst_id}")
+            seen_edges.add((src_id, dst_id))
+
+    if ai_insights and "architecture_pattern" in ai_insights and visited_global:
+        pattern = ai_insights["architecture_pattern"].replace('"', "'")
+        first_entry_id = get_node_id(entries[0])
+        lines.append(f'  arch_pattern["{pattern} Architecture"]')
+        lines.append(f"  arch_pattern --> {first_entry_id}")
+
+    if len(lines) == 1:
+        for idx, f in enumerate(files[:8]):
+            nid_val = f"fb{idx}"
+            label = Path(f["file_path"]).name.replace('"', "'")
+            lines.append(f'  {nid_val}["{label}"]')
+        for idx in range(min(len(files), 8) - 1):
+            lines.append(f"  fb{idx} --> fb{idx + 1}")
+
+    return "\n".join(lines)
+
+
+def _generate_flowchart_diagram(files: list[dict], ai_insights: dict | None = None) -> str:
+    if not files:
+        return "flowchart TD\n  start([No source files found])\n  start --> end_node([Upload a codebase])"
+
+    if _is_dotnet_project(files):
+        return _generate_blazor_flowchart(files, ai_insights)
+    return _generate_generic_flowchart(files, ai_insights)
 
 
 def _sanitize_mermaid_id(value: str) -> str:
