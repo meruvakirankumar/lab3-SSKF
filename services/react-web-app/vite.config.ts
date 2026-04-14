@@ -8,6 +8,12 @@ export default defineConfig({
   clearScreen: false,
   server: {
     allowedHosts: true,
+    proxy: {
+      "/api": {
+        target: process.env.VITE_API_BASE_URL ?? "http://localhost:8000",
+        changeOrigin: true,
+      },
+    },
   },
   resolve: {
     // Explicit aliases for reliable module resolution in both dev and SSR

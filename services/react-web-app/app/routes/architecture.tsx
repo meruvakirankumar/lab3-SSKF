@@ -1,3 +1,4 @@
+/// <reference types="vite/client" />
 import { useEffect, useState } from "react";
 import { useParams } from "react-router";
 import { Badge } from "~/components/ui/badge";
@@ -69,7 +70,7 @@ type ApiResponse<T> = {
   error?: string;
 };
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:3030";
+const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000";
 
 export default function Architecture() {
   const { projectId } = useParams();

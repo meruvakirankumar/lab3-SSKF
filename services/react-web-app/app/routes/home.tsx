@@ -70,7 +70,7 @@ type ApiResponse<T> = {
   error?: string;
 };
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:3030";
+const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000";
 
 export function meta({}: Route.MetaArgs) {
   return [

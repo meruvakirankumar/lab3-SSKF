@@ -159,6 +159,53 @@ DATAFLOWS_DB: dict[str, dict] = {}
 INSIGHTS_DB: dict[str, dict] = {}
 OPENAI_DISABLED = False
 
+# ── Disk-backed persistence helpers ───────────────────────────────────────────
+# Each DB file lives next to the project data so it survives server restarts.
+
+_DB_FILE = UPLOAD_ROOT / "_db.json"
+_DB_LOCK = None  # will be set to asyncio.Lock on first use
+
+
+def _load_db() -> None:
+    """Load all four in-memory DBs from disk (called once at startup)."""
+    global PROJECTS_DB, DIAGRAMS_DB, DATAFLOWS_DB, INSIGHTS_DB
+    if not _DB_FILE.exists():
+        return
+    try:
+        with _DB_FILE.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        PROJECTS_DB.update(data.get("projects", {}))
+        DIAGRAMS_DB.update(data.get("diagrams", {}))
+        DATAFLOWS_DB.update(data.get("dataflows", {}))
+        INSIGHTS_DB.update(data.get("insights", {}))
+        logger.info("Loaded %d project(s) from disk", len(PROJECTS_DB))
+    except Exception as exc:
+        logger.warning("Could not load DB from disk: %s", exc)
+
+
+def _save_db() -> None:
+    """Persist all four DBs to disk atomically."""
+    tmp = _DB_FILE.with_suffix(".tmp")
+    try:
+        with tmp.open("w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "projects": PROJECTS_DB,
+                    "diagrams": DIAGRAMS_DB,
+                    "dataflows": DATAFLOWS_DB,
+                    "insights": INSIGHTS_DB,
+                },
+                fh,
+            )
+        tmp.replace(_DB_FILE)
+    except Exception as exc:
+        logger.warning("Could not save DB to disk: %s", exc)
+
+
+# Load persisted state immediately so existing projects are available after
+# a server restart caused by hot-reload or a crash.
+_load_db()
+
 
 @router.get("/")
 async def root():
@@ -217,6 +264,8 @@ async def upload_codebase(
         logger.exception("Extraction failed for project %s", project_id)
         project["status"] = "failed"
         project["error_message"] = str(exc)
+
+    _save_db()
 
     return {
         "success": True,
@@ -283,6 +332,8 @@ async def analyze_project(project_id: str):
         logger.exception("Analysis failed for project %s", project_id)
         project["status"] = "failed"
         project["error_message"] = str(exc)
+
+    _save_db()
 
     return {
         "success": True,
@@ -639,6 +690,8 @@ def _store_analysis(project_id: str, files: list[dict]) -> None:
             "steps": flow["steps"],
             "description": flow["description"],
         }
+
+    _save_db()
 
 
 def _get_openai_analysis(files: list[dict]) -> dict | None:
